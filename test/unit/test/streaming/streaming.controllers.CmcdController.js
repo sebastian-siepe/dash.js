@@ -1127,6 +1127,46 @@ describe('CmcdController', function () {
             expect(metrics).to.have.property('v', 2);
         });
 
+        it('should include configured custom keys and ignore keys without a valid prefix', function () {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        enabled: true,
+                        version: 2,
+                        customKeys: [
+                            { key: 'org.svta-p-n', value: 'dash.js' },
+                            { key: 'org.svta-p-v', value: '5.2.2' },
+                            { key: 'invalidkey', value: 'should-be-ignored' }
+                        ]
+                    }
+                }
+            });
+            cmcdController.reset();
+            cmcdController.initialize();
+            cmcdController.setConfig({
+                abrController: abrControllerMock,
+                dashMetrics: dashMetricsMock,
+                playbackController: playbackControllerMock,
+                throughputController: throughputControllerMock,
+                serviceDescriptionController: serviceDescriptionControllerMock
+            });
+
+            const interceptor = cmcdController.getCmcdRequestInterceptors()[0];
+            const result = interceptor(createCommonMediaRequest({
+                url: 'http://example.com/segment.m4s',
+                type: HTTPRequest.MEDIA_SEGMENT_TYPE,
+                mediaType: 'video',
+                quality: 0,
+                representation: { mediaInfo: { bitrateList: [{ bandwidth: 10000 }] } },
+                duration: 4
+            }));
+
+            const metrics = getCmcdFromUrl(result.url);
+            expect(metrics).to.have.property('org.svta-p-n', 'dash.js');
+            expect(metrics).to.have.property('org.svta-p-v', '5.2.2');
+            expect(metrics).to.not.have.property('invalidkey');
+        });
+
         it('should attach buffered error codes (ec) to the next request only', function () {
             settings.update({ streaming: { cmcd: { enabled: true, version: 2 } } });
             cmcdController.reset();
