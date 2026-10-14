@@ -588,7 +588,10 @@ function CmcdController() {
         const defaultAvailableRequests = Constants.CMCD_AVAILABLE_REQUESTS;
         const invalidRequests = enabledRequests.filter(k => !defaultAvailableRequests.includes(k));
 
-        if (invalidRequests.length === enabledRequests.length) {
+        // An empty list contains no invalid entries. It is a valid configuration meaning
+        // "attach CMCD to no request", which CmcdModel.isIncludedInRequestFilter() already
+        // enforces, so it must not be reported as "all entries invalid".
+        if (enabledRequests.length > 0 && invalidRequests.length === enabledRequests.length) {
             logger.error(`None of the request types are supported.`);
             return false;
         }

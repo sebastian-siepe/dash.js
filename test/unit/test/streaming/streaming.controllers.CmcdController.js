@@ -1708,6 +1708,41 @@ describe('CmcdController', function () {
             });
         });
 
+        it('should treat an empty includeInRequests list as valid in v1', function () {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        enabled: true,
+                        version: 1,
+                        includeInRequests: []
+                    }
+                }
+            });
+            cmcdController.reset();
+            cmcdController.initialize();
+            cmcdController.setConfig({
+                abrController: abrControllerMock,
+                dashMetrics: dashMetricsMock,
+                playbackController: playbackControllerMock,
+                throughputController: throughputControllerMock,
+                serviceDescriptionController: serviceDescriptionControllerMock
+            });
+
+            // An empty list disables request mode. It is not "all entries invalid", so CMCD stays
+            // enabled; the request filter blocks every request type on its own.
+            expect(cmcdController.isCmcdEnabled()).to.be.true;
+
+            const result = cmcdController.getCmcdRequestInterceptors()[0](createCommonMediaRequest({
+                url: 'http://example.com/segment.m4s',
+                type: HTTPRequest.MEDIA_SEGMENT_TYPE,
+                mediaType: 'video',
+                quality: 0,
+                representation: { mediaInfo: { bitrateList: [{ bandwidth: 10000 }] } },
+                duration: 4
+            }));
+            expect(result.url).to.not.include('CMCD=');
+        });
+
         ['org.svta-p-n', 5].forEach((customKeys) => {
             it(`should ignore a non-array customKeys setting (${JSON.stringify(customKeys)})`, function () {
                 settings.update({ streaming: { cmcd: { enabled: false, customKeys } } });
