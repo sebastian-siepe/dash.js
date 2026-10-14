@@ -224,7 +224,7 @@ function CmcdController() {
             transmissionMode: cmcdConfigAccessor.get('mode') === Constants.CMCD_MODE_HEADERS ? CMCD_HEADERS : CMCD_QUERY,
             // Configured custom keys are enabled implicitly, otherwise the reporter's key filter would drop them
             enabledKeys: [...cmcdConfigAccessor.get('keys'), ...Object.keys(customKeys)],
-            eventTargets: _buildReporterTargets(),
+            eventTargets: _buildReporterTargets(customKeys),
             customKeys,
         };
 
@@ -265,7 +265,13 @@ function CmcdController() {
         }, {});
     }
 
-    function _buildReporterTargets() {
+    /**
+     * Builds the reporter's event target configurations.
+     * @param {object} [customKeys] - The validated custom keys, enabled on every target
+     * @return {Array.<object>}
+     * @private
+     */
+    function _buildReporterTargets(customKeys = {}) {
         const targets = cmcdConfigAccessor.getEventTargets();
 
         return targets.reduce((result, _target, index) => {
@@ -279,7 +285,10 @@ function CmcdController() {
                 events: accessor.get('targetEvents'),
                 interval: accessor.get('targetInterval') ?? Constants.CMCD_DEFAULT_TIME_INTERVAL,
                 batchSize: accessor.get('targetBatchSize') || 1,
-                enabledKeys: accessor.get('targetKeys'),
+                // Custom keys are persistent session data included in all reports. A target's key list
+                // is a strict allowlist that does not inherit the global one, so enable them per target
+                // as well, otherwise the target's filter drops them from event and response reports.
+                enabledKeys: [...accessor.get('targetKeys'), ...Object.keys(customKeys)],
                 responseReceivedTypes: accessor.get('targetResponseReceivedTypes'),
             });
 

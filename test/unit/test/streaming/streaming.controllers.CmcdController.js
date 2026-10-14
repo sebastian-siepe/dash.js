@@ -106,6 +106,37 @@ describe('CmcdController', function () {
             expect(metrics).to.have.property('e', 'ps');
         });
 
+        it('should include configured custom keys in event reports', () => {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        version: 2,
+                        customKeys: [
+                            { key: 'org.svta-p-n', value: 'dash.js' },
+                            { key: 'invalidkey', value: 'should-be-ignored' }
+                        ],
+                        eventTargets: [{
+                            url: 'https://cmcd.event.collector/api',
+                            enabled: true,
+                            // Deliberately omits the custom key: a target's enabledKeys is a strict
+                            // allowlist, so dash.js must enable configured custom keys per target
+                            enabledKeys: ['e', 'sta'],
+                            events: ['ps'],
+                            interval: 0
+                        }]
+                    }
+                }
+            });
+            cmcdController.initialize();
+
+            eventBus.trigger(MediaPlayerEvents.PLAYBACK_PLAYING);
+
+            expect(urlLoaderMock.load.calledOnce).to.be.true;
+            const metrics = decodeCmcd(decodeURIComponent(urlLoaderMock.load.firstCall.args[0].request.body));
+            expect(metrics).to.have.property('org.svta-p-n', 'dash.js');
+            expect(metrics).to.not.have.property('invalidkey');
+        });
+
         it('should not send any event if they are undefined', () => {
             settings.update({
                 streaming: {
