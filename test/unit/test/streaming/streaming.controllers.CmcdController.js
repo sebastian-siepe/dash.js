@@ -286,16 +286,23 @@ describe('CmcdController', function () {
             });
             eventBus.trigger(MediaPlayerEvents.PLAYBACK_PLAYING);
 
-            expect(urlLoaderMock.load.calledTwice).to.be.true;
+            // The error reports the code, then the fatal state, then playback resumes
+            expect(urlLoaderMock.load.calledThrice).to.be.true;
 
             const firstReport = decodeCmcd(decodeURIComponent(urlLoaderMock.load.firstCall.args[0].request.body));
             expect(firstReport).to.have.property('e', 'e');
             expect(firstReport.ec).to.deep.equal(['123']);
 
-            // The error event flushed the buffer; the following play state report must not carry ec
+            // The error event flushed the buffer; the following play state reports must not carry ec
             const secondReport = decodeCmcd(decodeURIComponent(urlLoaderMock.load.secondCall.args[0].request.body));
             expect(secondReport).to.have.property('e', 'ps');
+            expect(secondReport).to.have.property('sta', 'f');
             expect(secondReport).to.not.have.property('ec');
+
+            const thirdReport = decodeCmcd(decodeURIComponent(urlLoaderMock.load.thirdCall.args[0].request.body));
+            expect(thirdReport).to.have.property('e', 'ps');
+            expect(thirdReport).to.have.property('sta', 'p');
+            expect(thirdReport).to.not.have.property('ec');
         });
 
         it('should buffer ec per event target and report it once to each target', () => {
@@ -330,14 +337,15 @@ describe('CmcdController', function () {
                 url: call.args[0].request.url,
                 cmcd: decodeCmcd(decodeURIComponent(call.args[0].request.body))
             }));
-            const find = (url, e) => reports.find((r) => r.url === url && r.cmcd.e === e).cmcd;
+            // Reports in order: b.e, then the fatal state and the resumed state to both targets
+            const reportsFor = (url, e) => reports.filter((r) => r.url === url && r.cmcd.e === e).map((r) => r.cmcd);
 
-            expect(reports).to.have.lengthOf(3);
-            expect(find('https://cmcd.event.collector/b', 'e').ec).to.deep.equal(['123']);
+            expect(reports).to.have.lengthOf(5);
+            expect(reportsFor('https://cmcd.event.collector/b', 'e')[0].ec).to.deep.equal(['123']);
             // Target a did not record the error event, so its first report carries the code
-            expect(find('https://cmcd.event.collector/a', 'ps').ec).to.deep.equal(['123']);
+            expect(reportsFor('https://cmcd.event.collector/a', 'ps')[0].ec).to.deep.equal(['123']);
             // Target b already reported the code
-            expect(find('https://cmcd.event.collector/b', 'ps')).to.not.have.property('ec');
+            expect(reportsFor('https://cmcd.event.collector/b', 'ps')[0]).to.not.have.property('ec');
         });
 
         it('should accumulate error codes until the next event report', () => {
@@ -346,10 +354,13 @@ describe('CmcdController', function () {
                     cmcd: {
                         version: 2,
                         eventTargets: [{
+                            // An rr-only target records neither the error nor the fatal state report,
+                            // so both codes stay buffered until the next response is reported
                             url: 'https://cmcd.event.collector/api',
                             enabled: true,
-                            enabledKeys: ['e', 'ec', 'sta'],
-                            events: ['ps'],
+                            enabledKeys: ['e', 'ec', 'rc'],
+                            responseReceivedTypes: ['segment'],
+                            events: ['rr'],
                             interval: 0
                         }]
                     }
@@ -363,11 +374,124 @@ describe('CmcdController', function () {
             eventBus.trigger(MediaPlayerEvents.ERROR, {
                 error: { code: 27, data: { request: { type: 'someOtherRequestType' } } }
             });
-            eventBus.trigger(MediaPlayerEvents.PLAYBACK_PLAYING);
+            cmcdController.getCmcdResponseReceivedInterceptors()[0]({
+                status: 200,
+                request: {
+                    url: 'http://test.url/video.m4s',
+                    customData: { request: { type: HTTPRequest.MEDIA_SEGMENT_TYPE, url: 'http://test.url/video.m4s' } }
+                }
+            });
 
             expect(urlLoaderMock.load.calledOnce).to.be.true;
             const body = decodeURIComponent(urlLoaderMock.load.firstCall.args[0].request.body);
             expect(body).to.include('ec=("16" "27")');
+        });
+
+        it('should report a video element error code without setting sta=f', () => {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        version: 2,
+                        eventTargets: [{
+                            url: 'https://cmcd.event.collector/api',
+                            enabled: true,
+                            enabledKeys: ['e', 'ec', 'sta'],
+                            events: ['e', 'ps'],
+                            interval: 0
+                        }]
+                    }
+                }
+            });
+            cmcdController.initialize();
+
+            eventBus.trigger(MediaPlayerEvents.PLAYBACK_PLAYING);
+            urlLoaderMock.load.resetHistory();
+
+            // PLAYBACK_ERROR fires for every video element error, including ones dash.js recovers
+            // from internally. The code must be reported, but the session must not be marked fatal.
+            eventBus.trigger(MediaPlayerEvents.PLAYBACK_ERROR, { error: { code: 3 } });
+
+            expect(urlLoaderMock.load.calledOnce).to.be.true;
+            const report = decodeCmcd(decodeURIComponent(urlLoaderMock.load.firstCall.args[0].request.body));
+            expect(report).to.have.property('e', 'e');
+            expect(report.ec).to.deep.equal(['3']);
+            expect(report).to.not.have.property('sta', 'f');
+        });
+
+        it('should not send an error event when a video element error carries no code', () => {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        version: 2,
+                        eventTargets: [{
+                            url: 'https://cmcd.event.collector/api',
+                            enabled: true,
+                            enabledKeys: ['e', 'ec'],
+                            events: ['e'],
+                            interval: 0
+                        }]
+                    }
+                }
+            });
+            cmcdController.initialize();
+
+            // Per CTA-5004-B an e event MUST carry ec, so an uncoded error produces no report
+            eventBus.trigger(MediaPlayerEvents.PLAYBACK_ERROR, { error: {} });
+
+            expect(urlLoaderMock.load.called).to.be.false;
+        });
+
+        it('should not send an error event when a player error carries no code', () => {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        version: 2,
+                        eventTargets: [{
+                            url: 'https://cmcd.event.collector/api',
+                            enabled: true,
+                            enabledKeys: ['e', 'ec'],
+                            events: ['e'],
+                            interval: 0
+                        }]
+                    }
+                }
+            });
+            cmcdController.initialize();
+
+            eventBus.trigger(MediaPlayerEvents.ERROR, { error: { message: 'no code' } });
+
+            expect(urlLoaderMock.load.called).to.be.false;
+        });
+
+        it('should report a media error code once when it arrives via both error channels', () => {
+            settings.update({
+                streaming: {
+                    cmcd: {
+                        version: 2,
+                        eventTargets: [{
+                            url: 'https://cmcd.event.collector/api',
+                            enabled: true,
+                            enabledKeys: ['e', 'ec', 'sta'],
+                            events: ['e', 'ps'],
+                            interval: 0
+                        }]
+                    }
+                }
+            });
+            cmcdController.initialize();
+
+            // An unrecovered media error fires PLAYBACK_ERROR and then Events.ERROR with the same
+            // code. The code must be reported once, and the session must end up marked fatal.
+            eventBus.trigger(MediaPlayerEvents.PLAYBACK_ERROR, { error: { code: 3 } });
+            eventBus.trigger(MediaPlayerEvents.ERROR, { error: { code: 3, message: 'MEDIA_ERR_DECODE' } });
+
+            const reports = urlLoaderMock.load.getCalls()
+                .map((call) => decodeCmcd(decodeURIComponent(call.args[0].request.body)));
+
+            const withEc = reports.filter((report) => report.ec !== undefined);
+            expect(withEc).to.have.lengthOf(1);
+            expect(withEc[0].ec).to.deep.equal(['3']);
+            expect(reports.some((report) => report.sta === 'f')).to.be.true;
         });
 
         it('should not send a report when the ERROR event is triggered by a CMCD_EVENT', () => {
@@ -515,17 +639,21 @@ describe('CmcdController', function () {
             });
             cmcdController.initialize();
 
-            // Trigger a non-configured event (ERROR) - should NOT send a report
+            // The error (e) event is not configured, so no error report is sent. The fatal state it
+            // implies is reported as a play state (ps) change, which is configured.
             eventBus.trigger(MediaPlayerEvents.ERROR, {
                 error: { code: 100, message: 'test error', data: {} }
             });
-            expect(urlLoaderMock.load.called).to.be.false;
+            expect(urlLoaderMock.load.calledOnce).to.be.true;
+            const fatalReport = decodeCmcd(decodeURIComponent(urlLoaderMock.load.firstCall.args[0].request.body));
+            expect(fatalReport).to.have.property('e', 'ps');
+            expect(fatalReport).to.have.property('sta', 'f');
 
             // Trigger the configured event (PLAY_STATE via PLAYBACK_PLAYING) - should send a report
             eventBus.trigger(MediaPlayerEvents.PLAYBACK_PLAYING);
-            expect(urlLoaderMock.load.calledOnce).to.be.true;
+            expect(urlLoaderMock.load.calledTwice).to.be.true;
 
-            const requestSent = urlLoaderMock.load.firstCall.args[0].request;
+            const requestSent = urlLoaderMock.load.secondCall.args[0].request;
             const metrics = decodeCmcd(decodeURIComponent(requestSent.body));
             expect(metrics).to.have.property('e', 'ps');
         });
@@ -1422,22 +1550,24 @@ describe('CmcdController', function () {
             });
 
             it('should keep only the most recent error codes', function () {
-                for (let code = 1; code <= 12; code++) {
+                // DashJSError codes start at 10; codes 1-5 are MediaError codes that are captured
+                // from PLAYBACK_ERROR instead, so they are not buffered from Events.ERROR
+                for (let code = 10; code <= 21; code++) {
                     triggerError(code);
                 }
 
                 const result = cmcdController.getCmcdRequestInterceptors()[0](createCommonMediaRequest({ ...segmentRequest }));
-                expect(getCmcdFromUrl(result.url).ec).to.deep.equal(['3', '4', '5', '6', '7', '8', '9', '10', '11', '12']);
+                expect(getCmcdFromUrl(result.url).ec).to.deep.equal(['12', '13', '14', '15', '16', '17', '18', '19', '20', '21']);
             });
 
             it('should keep only as many error codes as set in maxBufferedErrorCodes', function () {
                 settings.update({ streaming: { cmcd: { maxBufferedErrorCodes: 2 } } });
-                triggerError(1);
-                triggerError(2);
-                triggerError(3);
+                triggerError(10);
+                triggerError(11);
+                triggerError(12);
 
                 const result = cmcdController.getCmcdRequestInterceptors()[0](createCommonMediaRequest({ ...segmentRequest }));
-                expect(getCmcdFromUrl(result.url).ec).to.deep.equal(['2', '3']);
+                expect(getCmcdFromUrl(result.url).ec).to.deep.equal(['11', '12']);
             });
 
             it('should attach buffered error codes to the next license request', function () {

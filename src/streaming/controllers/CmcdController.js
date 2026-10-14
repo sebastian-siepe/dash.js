@@ -68,10 +68,13 @@ function CmcdController() {
     let context = this.context;
     let eventBus = EventBus(context).getInstance();
     let debug = Debug(context).getInstance();
+    // PLAYBACK_ERROR is intentionally not mapped here: it fires for every video element error,
+    // including ones dash.js recovers from, so it must not set the fatal state (sta=f). The fatal
+    // state is driven by Events.ERROR (see _onPlayerError); the error code is captured from
+    // PLAYBACK_ERROR (see _onVideoElementError).
     const playbackStateMap = {
         [MediaPlayerEvents.PLAYBACK_INITIALIZED]: Constants.CMCD_PLAYER_STATES.STARTING,
         [MediaPlayerEvents.PLAYBACK_PAUSED]: Constants.CMCD_PLAYER_STATES.PAUSED,
-        [MediaPlayerEvents.PLAYBACK_ERROR]: Constants.CMCD_PLAYER_STATES.FATAL_ERROR,
         [MediaPlayerEvents.PLAYBACK_ENDED]: Constants.CMCD_PLAYER_STATES.ENDED,
     };
     let playbackStateHandlers = {};
@@ -155,6 +158,7 @@ function CmcdController() {
             eventBus.on(MediaPlayerEvents.PLAYBACK_STARTED, _onPlaybackStarted, instance);
         }
         eventBus.on(MediaPlayerEvents.ERROR, _onPlayerError, instance);
+        eventBus.on(MediaPlayerEvents.PLAYBACK_ERROR, _onVideoElementError, instance);
     }
 
     function _initializePlaybackStateListeners() {
@@ -352,6 +356,59 @@ function CmcdController() {
         _onPlaybackStateChange(Constants.CMCD_PLAYER_STATES.PLAYING);
     }
 
+    /**
+     * True for HTML5 MediaError codes (1-5), which arrive via PLAYBACK_ERROR. dash.js' own
+     * DashJSError codes start at 10 (see core/errors/Errors.js), so this range unambiguously
+     * identifies a video element error and keeps the two error channels from double-reporting.
+     * @param {number|string} errorCode
+     * @return {boolean}
+     * @private
+     */
+    function _isMediaElementErrorCode(errorCode) {
+        const code = Number(errorCode);
+        return Number.isInteger(code) && code >= 1 && code <= 5;
+    }
+
+    /**
+     * Buffers an error code for every report destination, so it is attached to the next report of
+     * each one as an inner list of strings, e.g. ec=("16" "27").
+     * @param {string} code
+     * @private
+     */
+    function _bufferErrorCodeForAllDestinations(code) {
+        // Without request mode nothing would ever flush the request buffer
+        if (isCmcdEnabled()) {
+            _bufferErrorCode(requestErrorCodes, code);
+        }
+        eventTargetErrorCodes.forEach((errorCodes) => _bufferErrorCode(errorCodes, code));
+    }
+
+    /**
+     * Handles video element errors (PLAYBACK_ERROR). These fire for every MediaError, including
+     * ones dash.js recovers from internally (e.g. a decode error handled by a MediaSource reset),
+     * which never reach Events.ERROR. The code is therefore always reported here, but the fatal
+     * state is not set: the player may recover, and if it does not, _onPlayerError sets sta=f.
+     * @param {object} errorData - { error: MediaError }
+     * @private
+     */
+    function _onVideoElementError(errorData) {
+        if (!cmcdReporter) {
+            return;
+        }
+
+        const errorCode = errorData?.error?.code;
+        if (!errorCode) {
+            // Per CTA-5004-B an error (e) event MUST be accompanied by an ec key
+            return;
+        }
+
+        // A pending rebuild recreates the event target buffers, so run it before buffering
+        _rebuildReporterIfNeeded();
+
+        _bufferErrorCodeForAllDestinations(String(errorCode));
+        triggerCmcdEventMode(Constants.CMCD_REPORTING_EVENTS.ERROR);
+    }
+
     function _onPlayerError(errorData) {
         if (errorData.error?.data?.request?.type === HTTPRequest.CMCD_EVENT) {
             return;
@@ -364,16 +421,21 @@ function CmcdController() {
         _rebuildReporterIfNeeded();
 
         const errorCode = errorData.error?.code || errorData.error?.data?.code;
-        if (errorCode) {
-            const code = String(errorCode);
-            // Without request mode nothing would ever flush the request buffer
-            if (isCmcdEnabled()) {
-                _bufferErrorCode(requestErrorCodes, code);
-            }
-            eventTargetErrorCodes.forEach((errorCodes) => _bufferErrorCode(errorCodes, code));
+
+        // Video element error codes (1-5) are captured from PLAYBACK_ERROR, which also fires for
+        // recoverable errors. Skip them here so an unrecovered media error is not reported twice.
+        // An e event MUST carry ec, so an error without a reportable code produces no e event.
+        if (errorCode && !_isMediaElementErrorCode(errorCode)) {
+            _bufferErrorCodeForAllDestinations(String(errorCode));
+            triggerCmcdEventMode(Constants.CMCD_REPORTING_EVENTS.ERROR);
         }
 
-        triggerCmcdEventMode(Constants.CMCD_REPORTING_EVENTS.ERROR);
+        // Every error that reaches Events.ERROR is fatal: dash.js recovers from non-fatal errors
+        // internally without dispatching it. If playback continues afterwards, the subsequent
+        // reports restore the running state, so a consumer can tell the error was not terminal.
+        // This must run after the error event above: any report flushes the buffered codes, so a
+        // play state report sent first would carry the ec that belongs to the error event.
+        _onPlaybackStateChange(Constants.CMCD_PLAYER_STATES.FATAL_ERROR);
     }
 
     function _rebuildReporterIfNeeded() {
@@ -698,6 +760,7 @@ function CmcdController() {
         eventBus.off(MediaPlayerEvents.PLAYBACK_STARTED, _onPlaybackStarted, instance);
         eventBus.off(MediaPlayerEvents.MANIFEST_LOADING_STARTED, _onPlaybackStarted, instance);
         eventBus.off(MediaPlayerEvents.ERROR, _onPlayerError, instance);
+        eventBus.off(MediaPlayerEvents.PLAYBACK_ERROR, _onVideoElementError, instance);
         eventBus.off(MediaPlayerEvents.PLAYBACK_PLAYING, _onPlaybackPlaying, instance)
         eventBus.off(MediaPlayerEvents.PLAYBACK_SEEKING, _onPlaybackSeeking, instance);
         eventBus.off(MediaPlayerEvents.PLAYBACK_WAITING, _onPlaybackWaiting, instance);
